@@ -3,6 +3,7 @@ import time
 import os
 import sys
 import logging
+#import json
 
 # Create and configure logger
 logging.basicConfig(filename="downloader.log",
@@ -12,9 +13,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # The offical test manga for mangadex
-test_manga_url = 'https://mangadex.org/title/f9c33607-9180-4ba6-b85c-e4b5faee7192/official-test-manga'
+# test_manga_url = 'https://mangadex.org/title/f9c33607-9180-4ba6-b85c-e4b5faee7192/official-test-manga'
 base_url = 'https://api.mangadex.org'
-manga_url = 'https://mangadex.org/title/7dc523b0-8ecd-40b0-b86c-1ea57c07773c/all-you-need-is-kill'
+# manga_url = 'https://mangadex.org/title/7dc523b0-8ecd-40b0-b86c-1ea57c07773c/all-you-need-is-kill'
+post_url = 'https://api.mangadex.network/report'
 
 def download(host: str, chapter_hash: str, quality: str, page: str, path: str, skip: bool):
     '''
@@ -30,30 +32,32 @@ def download(host: str, chapter_hash: str, quality: str, page: str, path: str, s
         page: Page metadata
         path: Dir to save image to
         skip: Skip pages that already exists
-    '''
-
-    ''' TODO 
-    https://api.mangadex.org/docs/retrieving-chapter/
-    Sometimes, a request for an image will fail. There can be many reasons for that. 
-    Typically it is caused by an unhealthy MangaDex@Home server. In order to keep track 
-    of the health of the servers in the network and to improve the quality of service and
-    reliability, we need you to report successes and failures when loading images.
-    The MangaDex@Home report endpoint is for this. For each image you retrieve (successfully or not)
-    from a base url that doesn't contain mangadex.org
     
-    - Call the network report endpoint to notify it (see just below)
-    - Call the /at-home/server/:chapterId endpoint again to get a new base url if it was a failure
-
-    POST https://api.mangadex.network/report
-    Content-Type: application/json
+    Returns:
+        response status code
     '''
+
     if os.path.exists(f"{path}/{page}") and skip:
         sys.stdout.write('Skipping %s\n' % (page))
-        logger.warning("Skipping %s", (page))
+        logger.warning(f"Skipping {page}")
         return None
     
     r = requests.get(f"{host}/{quality}/{chapter_hash}/{page}")
     sys.stdout.write('Retrieving [%s] \r' %(page))
+
+    # check if r.url is for main server or @home
+    # report MDX@home server if used regardless of success or failure.
+    # do not report main server
+    if r.url.find('uploads.mangadex.org') < -1:
+        data = {
+            "url": r.url,
+            "success": r.ok,
+            "bytes": len(r.content),
+            "duration": r.elapsed.total_seconds(),
+            "cached": False
+            }
+        post = requests.post(post_url, json=data)
+        logger.info(f'Post response: {post.text}')
 
     if r.status_code == 200:
         f = open(f"{path}/{page}", mode="wb")
@@ -63,11 +67,12 @@ def download(host: str, chapter_hash: str, quality: str, page: str, path: str, s
     # we're in trouble...
     else:
         sys.stdout.write('\nERROR %s \n' % (str(r.status_code)))
-        logger.critical("ERROR, %s while retrieving page from [%s]", (r.status_code, r.url))
+        logger.critical(f"ERROR, {r.status_code} while retrieving page from [{r.url}]")
     
     time.sleep(5)
+    return r.status_code
 
-def downloadChapter(chapter_id: str, quality: int, skip: bool):
+def downloadChapter(chapter_id: str, chapter_title:str, quality: str, skip: bool):
     '''
     Download a single Chapter.
 
@@ -76,41 +81,46 @@ def downloadChapter(chapter_id: str, quality: int, skip: bool):
 
     Args:
         chapter_id: Chapter id from manga feed
-        quality: 0 = data 1 = data-saver
+        chapter_title: name of chapter
+        quality: data or data-saver
         skip: Skip pages that already exists
     '''
 
     # going to Mangadex@home for our data
     # /at-home/server/:chapter-id
-    # admins don't like hardcoded baseurls
-    logger.info("Retrieving chapter %s", (chapter_id))
+    logger.info(f"Retrieving chapter {chapter_title}, ID = {chapter_id}")
     r = requests.get(f"{base_url}/at-home/server/{chapter_id}")
 
     if r.status_code == 200:
-        folder_path = f"MDX-{chapter_id}"
+        folder_path = f"MDX-{chapter_title}-{chapter_id}"
         os.makedirs(folder_path, exist_ok=True)
         
-        sys.stdout.write("Starting %s \n" % (chapter_id))
+        sys.stdout.write("Retrieving chapter: %s - %s \n" % (chapter_title, chapter_id))
         r_json = r.json()
 
         host = r_json["baseUrl"]
         chapter_hash = r_json["chapter"]["hash"]
-        data = r_json["chapter"]["data"]
-        data_saver = r_json["chapter"]["dataSaver"]
 
         # Choose between source/original quality or compressed images
-        if quality == 0:
-            for page in data:
-                download(host, chapter_hash, 'data', page, folder_path, skip)
-        elif quality == 1:
-            for page in data_saver:
-                download(host, chapter_hash, 'data-saver', page, folder_path, skip)
-    else:
-        sys.stdout.write('\nERROR %s \n' % (str(r.status_code)))
-        logger.critical("ERROR while retrieving chapter: %s", (r.status_code))
+        if quality == 'data-saver':
+            key = 'dataSaver'
+        else:
+            key = quality
 
-    sys.stdout.write("\nCompleted %s \n" % (chapter_id))
-    logger.info("Completed chapter %s", (chapter_id))
+        for page in r_json['chapter'][key]:
+            rcode = download(host, chapter_hash, quality, page, folder_path, skip)
+
+            # non 2xx response
+            if rcode == 504:
+                logger.warning(f"Error code {rcode}, retrying in 60s.")
+                time.sleep(60)
+                download(host, chapter_hash, quality, page, folder_path, skip)
+    else:
+        sys.stdout.write(f"ERROR while retrieving chapter: {r.status_code}")
+        logger.critical(f"ERROR while retrieving chapter: {r.status_code}")
+
+    sys.stdout.write(f"Completed chapter {chapter_id}")
+    logger.info(f"Completed chapter {chapter_id}")
 
 def getChapterHash(request: requests.Response) -> list:
     '''
@@ -125,7 +135,20 @@ def getChapterHash(request: requests.Response) -> list:
 
     return [chapter["id"] for chapter in request.json()["data"]]
 
-def downloadManga(manga_id: str, quality: int, skip: bool):
+def getChapterName(request: requests.Response) -> list:
+    '''
+    Return a list of chapter names
+    
+    Args:
+        request: Request obj for manga feed
+    
+    Returns:
+        A list of chapter names
+    '''
+
+    return [chapter["attributes"]['title'] for chapter in request.json()["data"]]
+
+def downloadManga(manga_id: str, quality: str, skip: bool):
     '''
     Download all manga chapters.
 
@@ -134,27 +157,31 @@ def downloadManga(manga_id: str, quality: int, skip: bool):
     
     Args:
         manga_id: manga id
-        quality: 0 = data 1 = data-saver
+        quality: data or data-saver
         skip: skip pages that already exists
     '''
 
-    logger.info('Attempting to retrieve %s...', (manga_id))
-    request = requests.get(base_url+'/manga/'+manga_id+'/feed',
+    logger.info(f"Attempting to retrieve {manga_id}...")
+    request = requests.get(f'{base_url}/manga/{manga_id}/feed',
                         params={'translatedLanguage[]': ["en"]}
                         )
     if request.status_code == 200:
-        folder_path = f"Mangadex-{manga_id}"
+        manga_info = requests.get(f'{base_url}/manga/{manga_id}').json()['data']
+        manga_title = manga_info['attributes']['title']['en']
+
+        folder_path = f"Mangadex-{manga_title}-{manga_id}"
         os.makedirs(folder_path, exist_ok=True)
-        os.chdir(folder_path)
+        os. chdir(folder_path)
 
         chapter_Ids = getChapterHash(request)
+        chapterTitle = getChapterName(request)
         chapter_count = len(chapter_Ids)
 
         for i in range(0, chapter_count):
             sys.stdout.write('\n %s of %s chapters\n' % (i+1, chapter_count))
-            downloadChapter(chapter_Ids[i], quality, skip)
+            downloadChapter(chapter_Ids[i], chapterTitle[i], quality, skip)
     else:
-        logger.critical("ERROR while retrieving manga: %s", (request.status_code))
+        logger.critical(f"ERROR while retrieving manga: {request.status_code}")
 
 def getMangaId(url: str) -> str:
     '''
@@ -170,5 +197,4 @@ def getMangaId(url: str) -> str:
     # TODO mangadex has a way of finding manga id by manga name
     return url.split('/')[4]
 
-#downloadManga(getMangaId(manga_url), 1, True)
-help(download)
+# downloadManga(getMangaId(manga_url), 1, True)
